@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   ASSISTANT_VOICE_OPTIONS,
+  getRealtimeVoiceConfiguration,
   type ApiMemoryMode,
   type AssistantVoiceOption,
 } from "@/lib/api";
@@ -335,6 +336,21 @@ export default function VoicePage() {
   const [voiceEndOptionsOpen, setVoiceEndOptionsOpen] = useState(false);
   const [endedVoiceThreadId, setEndedVoiceThreadId] = useState<string | null>(null);
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
+  const [voiceOptions, setVoiceOptions] = useState<ReadonlyArray<{ value: string; label: string }>>(ASSISTANT_VOICE_OPTIONS);
+  useEffect(() => {
+    let cancelled = false;
+    getRealtimeVoiceConfiguration().then(config => {
+      if (cancelled) return;
+      setVoiceOptions(config.voices.map(value => ({ value, label: value })));
+      const selected = useSessionStore.getState().assistantVoiceSelected;
+      if (!config.voices.includes(selected) && !useSessionStore.getState().voiceConnected) {
+        setAssistantVoiceSelected(config.default_voice);
+      }
+    }).catch(error => {
+      if (!cancelled) setVoiceError(error instanceof Error ? error.message : "Could not load voice configuration.");
+    });
+    return () => { cancelled = true; };
+  }, [setAssistantVoiceSelected, setVoiceError]);
 
   // Live call timer — derived from `connectedAt` so we don't need an effect
   // to reset state when the call ends. The interval ticks `now` purely to
@@ -746,7 +762,7 @@ export default function VoicePage() {
                   disabled={voiceConnected}
                   className="rounded-lg border border-oc-border bg-white px-2.5 py-1.5 text-[12px] font-mono normal-case tracking-normal text-oc-text-secondary disabled:opacity-60"
                 >
-                  {ASSISTANT_VOICE_OPTIONS.map((option) => (
+                  {voiceOptions.map((option) => (
                     <option key={option.label} value={option.value}>
                       {option.label}
                     </option>

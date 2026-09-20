@@ -1,7 +1,9 @@
+import { normalizeQwenRealtimeEvent, qwenClientEvent, QwenFollowUpResponses } from "./qwen-realtime-protocol";
 import {
   ApiError,
   checkRealtimeVoiceSafety,
   createRealtimeVoiceSession,
+  exchangeQwenRealtimeSdp,
   endRealtimeVoiceSession,
   executeRealtimeVoiceTool,
   heartbeatRealtimeVoiceRetryHandle,
@@ -124,6 +126,14 @@ export async function connectRealtimeVoiceSession(
   let peerConnection: RTCPeerConnection | null = null;
   let dataChannel: RTCDataChannel | null = null;
   let mediaStream: MediaStream | null = null;
+  let provider: "openai" | "qwen" = "openai";
+  let sessionConfigured = false;
+  let qwenConfigSent = false;
+  let sessionConfigTimeout: ReturnType<typeof setTimeout> | null = null;
+  let sessionLimitTimeout: ReturnType<typeof setTimeout> | null = null;
+  const originalAudioMuted = options.audioElement.muted;
+  const qwenFollowUps = new QwenFollowUpResponses();
+  const receivedEventIds = new Set<string>();
   let finalized = false;
   let disconnecting = false;
   let safetyInterrupted = false;
@@ -201,6 +211,8 @@ export async function connectRealtimeVoiceSession(
   ): Promise<void> {
     return disconnectCoordinator.disconnect(async () => {
       disconnecting = true;
+      if (sessionConfigTimeout) clearTimeout(sessionConfigTimeout);
+      if (sessionLimitTimeout) clearTimeout(sessionLimitTimeout);
       try {
         if (!safetyInterruption) abortSafetyChecksFailOpen();
         if (finalize && !finalized) setStatus("finalizing");
@@ -209,6 +221,7 @@ export async function connectRealtimeVoiceSession(
         mediaStream?.getTracks().forEach((track) => track.stop());
         options.audioElement.pause();
         options.audioElement.srcObject = null;
+        options.audioElement.muted = originalAudioMuted;
         await Promise.allSettled([...pendingToolExecutions]);
         pendingToolExecutions.clear();
         clearFollowUpResponseTimeouts();
@@ -241,13 +254,48 @@ export async function connectRealtimeVoiceSession(
       memoryMode: options.memoryMode,
       assistantVoice: options.assistantVoice,
     });
+    provider = session.provider ?? "openai";
     priorMessageCount = session.message_count;
     options.onSession?.(session);
 
     setStatus("requesting_microphone");
     mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
+    if (provider === "qwen") {
+      // Do not send microphone audio or play a default assistant before the
+      // server acknowledges the application policy and tool configuration.
+      mediaStream.getAudioTracks().forEach(track => { track.enabled = false; });
+      options.audioElement.muted = true;
+    }
     peerConnection = new RTCPeerConnection();
+    if (provider === "qwen") {
+      const configureQwen = (channel: RTCDataChannel) => {
+        if (qwenConfigSent || channel.readyState !== "open") return;
+        qwenConfigSent = true;
+        channel.send(serializeRealtimeEvent({ type: "session.update", session: session.session_config }));
+      };
+      peerConnection.ondatachannel = (event) => {
+        // Official Qwen WebRTC examples send AND receive on the server's
+        // "txt" channel. The locally created channel only negotiates SCTP.
+        if (event.channel.label !== "txt") return;
+        dataChannel = event.channel;
+        event.channel.addEventListener("open", () => configureQwen(event.channel));
+        event.channel.addEventListener("message", message => {
+          configureQwen(event.channel);
+          void handleDataChannelMessage(message.data);
+        });
+        event.channel.addEventListener("close", markTransportClosed);
+        event.channel.addEventListener("error", () => {
+          options.onError?.(new Error("Qwen Realtime data channel error."));
+          void disconnect();
+        });
+        configureQwen(event.channel);
+      };
+      sessionConfigTimeout = setTimeout(() => {
+        options.onError?.(new Error("Qwen did not acknowledge the voice policy configuration."));
+        void disconnect({ finalize: false });
+      }, 40000);
+    }
     peerConnection.ontrack = (event) => {
       options.audioElement.srcObject = event.streams[0];
     };
@@ -266,6 +314,8 @@ export async function connectRealtimeVoiceSession(
 
     dataChannel = peerConnection.createDataChannel("oai-events");
     dataChannel.addEventListener("open", () => {
+      if (provider === "qwen") return;
+      sessionConfigured = true;
       options.onReadyToSpeak?.(true);
       setStatus("connected");
     });
@@ -280,24 +330,25 @@ export async function connectRealtimeVoiceSession(
     setStatus("connecting");
     const offer = await peerConnection.createOffer();
     await peerConnection.setLocalDescription(offer);
+    if (provider === "qwen") await waitForIceGathering(peerConnection);
     const offerSdp = peerConnection.localDescription?.sdp;
     if (!offerSdp) {
       throw new Error("Realtime WebRTC offer did not include SDP.");
     }
 
-    const sdpResponse = await fetch(REALTIME_WEBRTC_URL, {
-      method: "POST",
-      body: offerSdp,
-      headers: {
-        Authorization: `Bearer ${session.client_secret}`,
-        "Content-Type": "application/sdp",
-      },
-    });
-    if (!sdpResponse.ok) {
-      throw new Error(`OpenAI Realtime SDP exchange failed: ${sdpResponse.status}`);
+    let answerSdp: string;
+    if (provider === "qwen") {
+      answerSdp = await exchangeQwenRealtimeSdp(session.client_secret, offerSdp);
+    } else {
+      const sdpResponse = await fetch(REALTIME_WEBRTC_URL, {
+        method: "POST", body: offerSdp,
+        headers: { Authorization: `Bearer ${session.client_secret}`, "Content-Type": "application/sdp" },
+        signal: AbortSignal.timeout(25000),
+      });
+      if (!sdpResponse.ok) throw new Error(`OpenAI Realtime SDP exchange failed: ${sdpResponse.status}`);
+      answerSdp = await sdpResponse.text();
     }
 
-    const answerSdp = await sdpResponse.text();
     await peerConnection.setRemoteDescription({
       type: "answer",
       sdp: answerSdp,
@@ -309,11 +360,14 @@ export async function connectRealtimeVoiceSession(
         if (!dataChannel || dataChannel.readyState !== "open") {
           throw new Error("Realtime data channel is not open.");
         }
-        dataChannel.send(serializeRealtimeEvent(event));
+        dataChannel.send(serializeRealtimeEvent(provider === "qwen" ? qwenClientEvent(event) : event));
       },
       disconnect,
     };
   } catch (error) {
+    if (sessionConfigTimeout) clearTimeout(sessionConfigTimeout);
+    if (sessionLimitTimeout) clearTimeout(sessionLimitTimeout);
+    options.audioElement.muted = originalAudioMuted;
     dataChannel?.close();
     peerConnection?.close();
     mediaStream?.getTracks().forEach((track) => track.stop());
@@ -341,6 +395,38 @@ export async function connectRealtimeVoiceSession(
       return;
     }
 
+    if (provider === "qwen") {
+      const eventId = typeof rawEvent.event_id === "string" ? rawEvent.event_id : undefined;
+      if (eventId && receivedEventIds.has(eventId)) return;
+      if (eventId) {
+        receivedEventIds.add(eventId);
+        if (receivedEventIds.size > 1024) receivedEventIds.delete(receivedEventIds.values().next().value!);
+      }
+      if (rawEvent.type === "session.updated" && qwenConfigSent && !sessionConfigured) {
+        sessionConfigured = true;
+        if (sessionConfigTimeout) clearTimeout(sessionConfigTimeout);
+        mediaStream?.getAudioTracks().forEach(track => { track.enabled = true; });
+        options.audioElement.muted = originalAudioMuted;
+        options.onReadyToSpeak?.(true);
+        setStatus("connected");
+        // A local cost guard, not a provider billing cap. End and summarize;
+        // a fresh session can then load the existing application-owned memory.
+        sessionLimitTimeout = setTimeout(() => { void disconnect().catch(options.onError); }, 20 * 60_000);
+      }
+      if (!sessionConfigured && rawEvent.type === "error") {
+        options.onError?.(new Error("Qwen rejected the voice policy configuration."));
+        void disconnect({ finalize: false });
+        return;
+      }
+      if (rawEvent.type === "input_audio_buffer.speech_started") {
+        options.audioElement.muted = true;  // Drain, but do not play, stale RTP audio.
+        for (const id of qwenFollowUps.interrupt()) releaseFollowUpResponseExpectation(id);
+      }
+      if (rawEvent.type === "response.created" && sessionConfigured && !safetyInterrupted) {
+        options.audioElement.muted = originalAudioMuted;
+      }
+      rawEvent = normalizeQwenRealtimeEvent(qwenFollowUps.responseCreated(rawEvent));
+    }
     options.onRawEvent?.(rawEvent);
     const parsed = parseRealtimeServerEvent(rawEvent);
     options.onParsedEvent?.(parsed);
@@ -348,6 +434,12 @@ export async function connectRealtimeVoiceSession(
 
     if (parsed.type === "input_audio_buffer.committed" && parsed.userItemId) {
       turnTracker.userInputCommitted(parsed.userItemId);
+    }
+    if (provider === "qwen" && parsed.type === "conversation.item.input_audio_transcription.failed") {
+      options.audioElement.muted = true;
+      options.onError?.(new Error("Qwen input transcription failed; ending voice because safety checks need the transcript."));
+      void disconnect().catch(options.onError);
+      return;
     }
     if (parsed.failedUserTranscriptionItemId) {
       turnTracker.finishUserTranscription(parsed.failedUserTranscriptionItemId);
@@ -579,6 +671,7 @@ export async function connectRealtimeVoiceSession(
         abortSafetyChecksFailOpen();
         options.audioElement.pause();
         options.audioElement.srcObject = null;
+        options.audioElement.muted = originalAudioMuted;
         options.onAgentSpeaking?.(false);
         options.onReadyToSpeak?.(false);
         if (dataChannel?.readyState === "open") {
@@ -671,6 +764,7 @@ export async function connectRealtimeVoiceSession(
       status: "started",
     });
 
+    const toolGeneration = qwenFollowUps.generation;
     try {
       const currentUserMessage = await currentUserMessageForToolCall(
         call,
@@ -694,7 +788,7 @@ export async function connectRealtimeVoiceSession(
           output: result.output,
         });
       }
-      if (disconnecting || dataChannel.readyState !== "open") return;
+      if (disconnecting || dataChannel.readyState !== "open" || (provider === "qwen" && toolGeneration !== qwenFollowUps.generation)) return;
       dataChannel.send(
         serializeRealtimeEvent(buildFunctionCallOutputEvent(call.callId, result.output))
       );
@@ -718,7 +812,7 @@ export async function connectRealtimeVoiceSession(
           error: message,
         });
       }
-      if (!disconnecting && dataChannel.readyState === "open") {
+      if (!disconnecting && dataChannel.readyState === "open" && (provider !== "qwen" || toolGeneration === qwenFollowUps.generation)) {
         dataChannel.send(
           serializeRealtimeEvent(
             buildFunctionCallOutputEvent(call.callId, { error: message })
@@ -750,9 +844,9 @@ export async function connectRealtimeVoiceSession(
     }
 
     const requestEventId = `response-create-${globalThis.crypto.randomUUID()}`;
-    dataChannel.send(
-      serializeRealtimeEvent(buildResponseCreateEvent(null, requestEventId))
-    );
+    const event = buildResponseCreateEvent(null, requestEventId);
+    if (provider === "qwen") qwenFollowUps.expect(requestEventId);
+    dataChannel.send(serializeRealtimeEvent(provider === "qwen" ? qwenClientEvent(event) : event));
     if (!turnTracker.expectNextResponseForTurn(clientTurnId, requestEventId)) return;
 
     followUpResponseTimeouts.set(
@@ -764,6 +858,7 @@ export async function connectRealtimeVoiceSession(
   }
 
   function releaseFollowUpResponseExpectation(requestEventId: string): void {
+    qwenFollowUps.forget(requestEventId);
     clearFollowUpResponseTimeout(requestEventId);
     if (turnTracker.failExpectedResponse(requestEventId)) {
       void maybeRecordTurn().catch(() => undefined);
@@ -849,4 +944,21 @@ export async function connectRealtimeVoiceSession(
     clearTimeout(waiter.timeout);
     waiter.resolve(latestUserTranscriptEvidence());
   }
+}
+
+
+async function waitForIceGathering(peer: RTCPeerConnection): Promise<void> {
+  if (peer.iceGatheringState === "complete") return;
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timeout);
+      peer.removeEventListener("icegatheringstatechange", onChange);
+    };
+    const onChange = () => {
+      if (peer.iceGatheringState === "complete") { cleanup(); resolve(); }
+    };
+    const timeout = setTimeout(() => { cleanup(); reject(new Error("WebRTC ICE gathering timed out.")); }, 10000);
+    peer.addEventListener("icegatheringstatechange", onChange);
+    onChange();
+  });
 }

@@ -79,6 +79,10 @@ Voice support is being rebuilt on the OpenAI Realtime path. The backend has acti
 
 ---
 
+## Third-party providers (experimental)
+
+Qwen and DeepSeek text providers, independent embeddings, and an opt-in Qwen3.5-Omni WebRTC adapter are documented in [Provider adaptation](docs/provider-adaptation.md). Cloud-model and real-audio acceptance tests are still required before deployment.
+
 ## Quick start
 
 The fastest persistent dogfood path — clone, set an API key, start local Postgres, then launch the text TUI:

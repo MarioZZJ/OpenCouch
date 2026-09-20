@@ -9,7 +9,7 @@ from collections.abc import Mapping
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from agent.voice import realtime
+from agent.voice import realtime, qwen_realtime
 from agent.voice import tools as voice_tools
 from agent.voice.runtime_facade import (
     VoicePendingTurnCapacityError,
@@ -35,6 +35,7 @@ from api.dependencies import (
 from api.session_end import end_runtime_session
 from api.models import (
     VoiceRealtimeSessionRequest,
+    VoiceQwenSdpRequest,
     VoiceRealtimeSessionResponse,
     VoiceConcurrentSafetyRequest,
     VoiceConcurrentSafetyResponse,
@@ -86,13 +87,16 @@ async def create_voice_realtime_session(
         )
     except Exception:
         message_count = 0
-    session_config = realtime.build_realtime_session_config(
-        thread_id=body.thread_id,
-        user_id=body.user_id,
-        memory_mode=selection.memory_mode,
-        memory_context=memory_context,
-        assistant_voice=body.assistant_voice,
-    )
+    try:
+        session_config = realtime.build_realtime_session_config(
+            thread_id=body.thread_id,
+            user_id=body.user_id,
+            memory_mode=selection.memory_mode,
+            memory_context=memory_context,
+            assistant_voice=body.assistant_voice,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
         client_secret = await realtime.create_realtime_client_secret(
             session_config=session_config,
@@ -113,6 +117,7 @@ async def create_voice_realtime_session(
 
     return VoiceRealtimeSessionResponse(
         client_secret=client_secret,
+        provider=realtime.get_voice_provider(),
         thread_id=body.thread_id,
         user_id=body.user_id,
         memory_mode=selection.memory_mode,
@@ -570,3 +575,29 @@ def _voice_turn_request_hash(body: VoiceTurnRecordRequest) -> str:
     )
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+@router.get("/realtime/config")
+async def get_voice_configuration() -> dict[str, object]:
+    """Expose public voice choices only, never credentials or workspace endpoints."""
+    try:
+        return realtime.get_voice_capabilities()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/realtime/qwen/sdp")
+async def exchange_qwen_voice_sdp(body: VoiceQwenSdpRequest) -> dict[str, str]:
+    """Redeem a one-use local ticket, not an arbitrary HTTP proxy."""
+    if realtime.get_voice_provider() != "qwen":
+        raise HTTPException(status_code=404, detail="Qwen voice is not enabled.")
+    try:
+        ticket = qwen_realtime.TICKETS.consume(body.ticket)
+    except ValueError as exc:
+        raise HTTPException(status_code=410, detail=str(exc)) from exc
+    try:
+        return {"sdp": await qwen_realtime.exchange_sdp(ticket, body.sdp)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc

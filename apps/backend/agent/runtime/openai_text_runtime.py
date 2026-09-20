@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Mapping
 from typing import Any, cast
 
 from agents import Runner
+from llm.sdk_models import sdk_run_kwargs
 from agent.guardrails.prompts import build_crisis_response_prompt
 from agent.models import Channel, CrisisAssessment, MessageRole
 from agent.observability.decorators import trace_event, trace_span
@@ -77,6 +78,7 @@ class OpenAIAgentsSDKRunner:
             context=context,
             max_turns=3,
             session=session,
+            **sdk_run_kwargs(context),
         )
 
     async def run_triage(
@@ -91,6 +93,7 @@ class OpenAIAgentsSDKRunner:
             input_text,
             context=context,
             max_turns=1,
+            **sdk_run_kwargs(context, triage=True),
         )
 
     def run_streamed(
@@ -107,6 +110,7 @@ class OpenAIAgentsSDKRunner:
             context=context,
             max_turns=3,
             session=session,
+            **sdk_run_kwargs(context),
         )
 
 

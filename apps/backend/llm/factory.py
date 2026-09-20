@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from llm.providers import LLMProvider, default_model
+from llm.compatible_client import CompatibleLLMClient
 
 from llm.base import BaseLLMClient
 from llm.openai_client import DEFAULT_OPENAI_MODEL, OpenAILLMClient
-
-LLMProvider = Literal["openai"]
 
 
 def create_llm_client(
@@ -36,6 +35,11 @@ def create_llm_client(
         return OpenAILLMClient(
             api_key=api_key,
             model=model or DEFAULT_OPENAI_MODEL,
+        )
+
+    if provider in {"qwen", "deepseek", "openai_compatible"}:
+        return CompatibleLLMClient(
+            provider=provider, model=model or default_model(provider), api_key=api_key
         )
 
     raise ValueError(f"Unsupported LLM provider: {provider}")

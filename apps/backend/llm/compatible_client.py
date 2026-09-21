@@ -17,6 +17,35 @@ from llm.providers import (
     provider_connection,
 )
 
+# Reasoning request policy is set by LLM_REASONING_EFFORT:
+#   * unset            -> DEFAULT_REASONING_EFFORT (reasoning on, highest level)
+#   * a supported level -> thinking is enabled and reasoning_effort is sent,
+#     which is how a vendor-neutral caller asks for reasoned output.
+#   * "none"           -> a dedicated reasoning-off value: no thinking field and
+#     no reasoning_effort are sent, restoring the earlier low-latency behaviour.
+# Qwen and DeepSeek both ignore an unknown level rather than failing the request,
+# so an unmodelled value cannot turn a working call into an error.
+REASONING_OFF = "none"
+REASONING_EFFORTS = ("minimal", "low", "medium", "high", "max")
+DEFAULT_REASONING_EFFORT = "max"
+
+
+def resolve_reasoning_effort(value: str | None = None) -> str | None:
+    """Return the configured reasoning effort, or None when reasoning is off."""
+
+    if value is None:
+        value = os.getenv("LLM_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)
+    normalized = value.strip().lower()
+    if not normalized or normalized == REASONING_OFF:
+        return None
+    if normalized not in REASONING_EFFORTS:
+        raise ProviderConfigurationError(
+            "LLM_REASONING_EFFORT must be one of "
+            f"{', '.join(REASONING_EFFORTS)}, or {REASONING_OFF} to disable "
+            "reasoning."
+        )
+    return normalized
+
 
 class CompatibleLLMClient(BaseLLMClient):
     """Retain local schema validation; never pretend an unsupported search succeeded."""
@@ -47,14 +76,19 @@ class CompatibleLLMClient(BaseLLMClient):
         self.client = AsyncOpenAI(
             api_key=key, base_url=url, timeout=timeout, max_retries=1
         )
-        # Low latency, bounded costs, and no reasoning-history replay dependency.
-        self.extra_body: dict[str, Any] = (
-            {"enable_thinking": False}
-            if provider == "qwen"
-            else {"thinking": {"type": "disabled"}}
-            if provider == "deepseek"
-            else {}
-        )
+        # Reasoning is requested through the same extra_body channel as the rest
+        # of the vendor-specific wire fields. Without it, low latency and bounded
+        # costs win; with it, the model is asked to reason before answering.
+        self.reasoning_effort = resolve_reasoning_effort()
+        self.extra_body: dict[str, Any] = {}
+        if self.reasoning_effort is not None and provider in {"qwen", "deepseek"}:
+            # Qwen needs an explicit opt-in; DeepSeek's own switch also wins over
+            # an effort hint, so its thinking type has to be enabled for the
+            # effort to have any effect at all.
+            self.extra_body["enable_thinking" if provider == "qwen" else "thinking"] = (
+                True if provider == "qwen" else {"type": "enabled"}
+            )
+            self.extra_body["reasoning_effort"] = self.reasoning_effort
 
     def _request(
         self, *, prompt: str, system_instruction: str | None, use_search: bool = False

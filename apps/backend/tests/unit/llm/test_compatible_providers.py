@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from agents import Agent, RunConfig, Runner, function_tool
-from llm.compatible_client import CompatibleLLMClient
+from llm.compatible_client import CompatibleLLMClient, resolve_reasoning_effort
 from llm.providers import ProviderConfigurationError, UnsupportedProviderCapability
 from llm.sdk_models import CompatibleChatModel, sdk_run_kwargs
 from pydantic import BaseModel
@@ -52,11 +52,17 @@ def make_client(monkeypatch, handler, *, provider="qwen", model="qwen-flash"):
 @pytest.mark.parametrize(
     "provider,model,extra",
     [
-        ("qwen", "qwen-flash", {"enable_thinking": False}),
-        ("deepseek", "deepseek-flash", {"thinking": {"type": "disabled"}}),
+        ("qwen", "qwen-flash", {"enable_thinking": True, "reasoning_effort": "max"}),
+        (
+            "deepseek",
+            "deepseek-flash",
+            {"thinking": {"type": "enabled"}, "reasoning_effort": "max"},
+        ),
     ],
 )
 async def test_text_wire_protocol(monkeypatch, provider, model, extra):
+    # Reasoning is on by default; LLM_REASONING_EFFORT drives the level.
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "max")
     requests = []
 
     def handler(request):
@@ -71,6 +77,44 @@ async def test_text_wire_protocol(monkeypatch, provider, model, extra):
     assert all(payload[key] == value for key, value in extra.items())
     assert "input" not in payload
     await client.client.close()
+
+
+@pytest.mark.parametrize("provider", ["qwen", "deepseek"])
+async def test_reasoning_off_is_the_explicit_disable_path(monkeypatch, provider):
+    """LLM_REASONING_EFFORT=none must send no reasoning fields at all."""
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "none")
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json=completion("你好"))
+
+    client = make_client(monkeypatch, handler, provider=provider, model="x-model")
+    assert await client.generate_text(prompt="test") == "你好"
+    payload = json.loads(requests[0].content)
+    assert "reasoning_effort" not in payload
+    assert "enable_thinking" not in payload
+    assert "thinking" not in payload
+    await client.client.close()
+
+
+async def test_default_reasoning_effort_is_highest_level(monkeypatch):
+    """With the env var unset, reasoning defaults on at the highest level."""
+    monkeypatch.delenv("LLM_REASONING_EFFORT", raising=False)
+    assert resolve_reasoning_effort() == "max"
+    assert resolve_reasoning_effort("max") == "max"
+    assert resolve_reasoning_effort("none") is None
+    assert resolve_reasoning_effort("") is None
+
+
+async def test_unsupported_reasoning_effort_is_rejected(monkeypatch):
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "turbo")
+
+    def handler(request):
+        return httpx.Response(200, json=completion("你好"))
+
+    with pytest.raises(ProviderConfigurationError):
+        make_client(monkeypatch, handler, provider="deepseek", model="x-model")
 
 
 async def test_structured_repair_is_bounded_and_validates_locally(monkeypatch):
@@ -150,9 +194,9 @@ async def test_sdk_structured_agent_wire_uses_json_mode(monkeypatch):
     body = bodies[0]
     assert body["response_format"] == {"type": "json_object"}
     assert body["model"] == "deepseek-flash"
-    assert body["thinking"] == {"type": "disabled"}
+    assert body["thinking"] == {"type": "enabled"}
     assert "JSON Schema" in body["messages"][0]["content"]
-    assert "reasoning_effort" not in body
+    assert body["reasoning_effort"] == "max"
     await client.client.close()
 
 

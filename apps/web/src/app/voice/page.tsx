@@ -56,8 +56,11 @@ function safeServerHost(value: string | null | undefined): string {
   }
 }
 
-function assistantVoiceLabel(value: string): string {
-  const match = ASSISTANT_VOICE_OPTIONS.find((option) => option.value === value);
+function assistantVoiceLabel(
+  value: string,
+  options: ReadonlyArray<{ value: string; label: string }>,
+): string {
+  const match = options.find((option) => option.value === value);
   return match?.label ?? (value || "default");
 }
 
@@ -341,7 +344,12 @@ export default function VoicePage() {
     let cancelled = false;
     getRealtimeVoiceConfiguration().then(config => {
       if (cancelled) return;
-      setVoiceOptions(config.voices.map(value => ({ value, label: value })));
+      // `voices` carries the provider's authoritative IDs. `voice_labels` only
+      // supplies friendlier display text; a voice without a label falls back to
+      // showing its ID, and the ID is always what gets sent upstream.
+      setVoiceOptions(
+        config.voices.map(value => ({ value, label: config.voice_labels?.[value] ?? value })),
+      );
       const selected = useSessionStore.getState().assistantVoiceSelected;
       if (!config.voices.includes(selected) && !useSessionStore.getState().voiceConnected) {
         setAssistantVoiceSelected(config.default_voice);
@@ -774,7 +782,7 @@ export default function VoicePage() {
             {/* Single meta line — replaces the four debug cards. */}
             <div className="oc-voice-meta">
               <span>
-                voice <b>{assistantVoiceLabel(assistantVoiceSelected)}</b>
+                voice <b>{assistantVoiceLabel(assistantVoiceSelected, voiceOptions)}</b>
               </span>
               <span className="sep">·</span>
               <span>
@@ -878,7 +886,8 @@ export default function VoicePage() {
                   voice{" "}
                   <b>
                     {assistantVoiceLabel(
-                      voiceSessionInfo?.assistantVoice || assistantVoiceSelected
+                      voiceSessionInfo?.assistantVoice || assistantVoiceSelected,
+                      voiceOptions,
                     )}
                   </b>
                 </span>

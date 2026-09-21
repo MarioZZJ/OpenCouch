@@ -139,6 +139,9 @@ def get_voice_capabilities() -> dict[str, Any]:
                 "QWEN_REALTIME_VOICE", qwen_realtime.DEFAULT_VOICE
             ),
             "voices": qwen_realtime.voice_options(),
+            # Display names only; the `voices` IDs remain authoritative and are
+            # what gets sent to Qwen.
+            "voice_labels": qwen_realtime.voice_labels(),
             "experimental": True,
         }
     return {
@@ -146,5 +149,6 @@ def get_voice_capabilities() -> dict[str, Any]:
         "model": DEFAULT_REALTIME_MODEL,
         "default_voice": DEFAULT_REALTIME_VOICE,
         "voices": sorted(SUPPORTED_REALTIME_VOICES),
+        "voice_labels": {},
         "experimental": False,
     }

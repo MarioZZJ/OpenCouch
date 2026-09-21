@@ -991,6 +991,8 @@ export interface RealtimeVoiceConfiguration {
   model: string;
   default_voice: string;
   voices: string[];
+  /** Optional display names keyed by voice ID. Display-only; never sent upstream. */
+  voice_labels?: Record<string, string>;
   experimental: boolean;
 }
 

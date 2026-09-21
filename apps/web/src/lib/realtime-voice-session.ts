@@ -131,6 +131,8 @@ export async function connectRealtimeVoiceSession(
   let qwenConfigSent = false;
   let sessionConfigTimeout: ReturnType<typeof setTimeout> | null = null;
   let sessionLimitTimeout: ReturnType<typeof setTimeout> | null = null;
+  let micLevelTimer: ReturnType<typeof setInterval> | null = null;
+  let rtpStatsTimer: ReturnType<typeof setInterval> | null = null;
   const originalAudioMuted = options.audioElement.muted;
   const qwenFollowUps = new QwenFollowUpResponses();
   const receivedEventIds = new Set<string>();
@@ -213,6 +215,8 @@ export async function connectRealtimeVoiceSession(
       disconnecting = true;
       if (sessionConfigTimeout) clearTimeout(sessionConfigTimeout);
       if (sessionLimitTimeout) clearTimeout(sessionLimitTimeout);
+      if (micLevelTimer) { clearInterval(micLevelTimer); micLevelTimer = null; }
+      if (rtpStatsTimer) { clearInterval(rtpStatsTimer); rtpStatsTimer = null; }
       try {
         if (!safetyInterruption) abortSafetyChecksFailOpen();
         if (finalize && !finalized) setStatus("finalizing");
@@ -260,6 +264,54 @@ export async function connectRealtimeVoiceSession(
 
     setStatus("requesting_microphone");
     mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+    // Diagnostics for the "connected but silent" Qwen failure mode. If the
+    // microphone gain reads ~0 the capture device is the problem; if it reads a
+    // healthy level while the server never sends input_audio_buffer.speech_started,
+    // the audio is captured but the provider's VAD is not reacting.
+    if (provider === "qwen") {
+      const micTrack = mediaStream.getAudioTracks()[0];
+      const settings = micTrack?.getSettings?.() ?? {};
+      console.debug("[opencouch][mic] track", {
+        label: micTrack?.label,
+        enabled: micTrack?.enabled,
+        muted: micTrack?.muted,
+        readyState: micTrack?.readyState,
+        deviceId: settings.deviceId,
+        sampleRate: settings.sampleRate,
+        channelCount: settings.channelCount,
+        autoGainControl: settings.autoGainControl,
+        echoCancellation: settings.echoCancellation,
+        noiseSuppression: settings.noiseSuppression,
+      });
+      try {
+        const AudioContextCtor =
+          window.AudioContext ??
+          (window as unknown as { webkitAudioContext?: typeof AudioContext })
+            .webkitAudioContext;
+        if (AudioContextCtor) {
+          const context = new AudioContextCtor();
+          const analyser = context.createAnalyser();
+          analyser.fftSize = 2048;
+          context.createMediaStreamSource(mediaStream).connect(analyser);
+          const buffer = new Float32Array(analyser.fftSize);
+          let peak = 0;
+          micLevelTimer = setInterval(() => {
+            analyser.getFloatTimeDomainData(buffer);
+            let sum = 0;
+            for (const sample of buffer) sum += sample * sample;
+            const rms = Math.sqrt(sum / buffer.length);
+            if (rms > peak) peak = rms;
+            console.debug(
+              `[opencouch][mic] rms=${rms.toFixed(4)} peak=${peak.toFixed(4)} ` +
+                `trackEnabled=${micTrack?.enabled}`,
+            );
+          }, 2000);
+        }
+      } catch (error) {
+        console.debug("[opencouch][mic] level meter unavailable", error);
+      }
+    }
 
     if (provider === "qwen") {
       // Do not send microphone audio or play a default assistant before the
@@ -409,12 +461,65 @@ export async function connectRealtimeVoiceSession(
         options.audioElement.muted = originalAudioMuted;
         options.onReadyToSpeak?.(true);
         setStatus("connected");
+        // Does audio actually leave the browser? outbound-rtp.packetsSent
+        // climbing while the server never emits speech_started means the media
+        // reaches the transport but the provider's VAD is not reacting.
+        if (provider === "qwen" && !rtpStatsTimer) {
+          rtpStatsTimer = setInterval(() => {
+            void peerConnection
+              ?.getStats()
+              .then((stats) => {
+                stats.forEach((report) => {
+                  const type = (report as { type?: string }).type;
+                  const kind = (report as { kind?: string }).kind;
+                  if (type === "outbound-rtp" && kind === "audio") {
+                    const out = report as {
+                      packetsSent?: number;
+                      bytesSent?: number;
+                    };
+                    console.debug(
+                      `[opencouch][rtp] audio packetsSent=${out.packetsSent} ` +
+                        `bytesSent=${out.bytesSent}`,
+                    );
+                  }
+                  if (type === "remote-inbound-rtp") {
+                    const remote = report as {
+                      packetsReceived?: number;
+                      packetsLost?: number;
+                    };
+                    console.debug(
+                      `[opencouch][rtp] server saw packetsReceived=${remote.packetsReceived} ` +
+                        `packetsLost=${remote.packetsLost}`,
+                    );
+                  }
+                });
+              })
+              .catch(() => undefined);
+          }, 3000);
+        }
         // A local cost guard, not a provider billing cap. End and summarize;
         // a fresh session can then load the existing application-owned memory.
         sessionLimitTimeout = setTimeout(() => { void disconnect().catch(options.onError); }, 20 * 60_000);
       }
       if (!sessionConfigured && rawEvent.type === "error") {
-        options.onError?.(new Error("Qwen rejected the voice policy configuration."));
+        // Surface Qwen's own diagnostic. Without the code/param/message this
+        // failure is indistinguishable from a transport problem. The error
+        // payload carries no credentials - only the provider's rejection reason.
+        const rawError = rawEvent.error;
+        const qwenError: Record<string, unknown> =
+          typeof rawError === "object" && rawError !== null && !Array.isArray(rawError)
+            ? (rawError as Record<string, unknown>)
+            : {};
+        const detail = [qwenError.code, qwenError.param, qwenError.message]
+          .filter((part): part is string => typeof part === "string" && part.length > 0)
+          .join(" | ");
+        options.onError?.(
+          new Error(
+            detail
+              ? `Qwen rejected the voice policy configuration: ${detail}`
+              : "Qwen rejected the voice policy configuration.",
+          ),
+        );
         void disconnect({ finalize: false });
         return;
       }
@@ -427,8 +532,21 @@ export async function connectRealtimeVoiceSession(
       }
       rawEvent = normalizeQwenRealtimeEvent(qwenFollowUps.responseCreated(rawEvent));
     }
-    options.onRawEvent?.(rawEvent);
-    const parsed = parseRealtimeServerEvent(rawEvent);
+    // Qwen audio-input diagnostics. When a session reports "connected" but no
+    // transcript or reply ever appears, the decisive question is whether the
+    // server-side VAD is firing at all: input_audio_buffer.speech_started proves
+    // the microphone audio reached the model. Log just those signal events, not
+    // every delta, so the console stays readable. No credentials are involved.
+    if (
+      provider === "qwen" &&
+      typeof rawEvent.type === "string" &&
+      (rawEvent.type.startsWith("input_audio_buffer.") ||
+        rawEvent.type.includes("input_audio_transcription") ||
+        rawEvent.type === "error")
+    ) {
+      console.debug("[opencouch][qwen-audio]", rawEvent.type, rawEvent);
+    }
+    options.onRawEvent?.(rawEvent);    const parsed = parseRealtimeServerEvent(rawEvent);
     options.onParsedEvent?.(parsed);
     if (safetyInterrupted) return;
 

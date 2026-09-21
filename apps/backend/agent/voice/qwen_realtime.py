@@ -29,11 +29,69 @@ DEFAULT_MODEL = "qwen3.5-omni-flash-realtime"
 DEFAULT_VOICE = "Tina"
 
 
+def _simplify_schema_types(node: Any) -> Any:
+    """Drop JSON-Schema union types that Qwen's realtime parser rejects.
+
+    OpenAI accepts a parameter declared as ``{"type": ["string", "null"]}``.
+    Qwen's ``session.update`` parser does not: a tool schema containing a
+    nullable union makes the whole session.update fail with a generic
+    ``InternalError: Parse RealtimeEvent error``, so the voice session never
+    reaches ``session.updated``.
+
+    Every affected parameter in the voice tool surface is optional and is not
+    listed in ``required``, so collapsing ``["string", "null"]`` to ``"string"``
+    keeps the same meaning: omitting the property is still valid, and the
+    runtime already treats an absent value as None.
+    """
+
+    if isinstance(node, dict):
+        simplified = {key: _simplify_schema_types(value) for key, value in node.items()}
+        node_type = simplified.get("type")
+        if isinstance(node_type, list):
+            non_null = [entry for entry in node_type if entry != "null"]
+            if len(non_null) == 1 and len(non_null) != len(node_type):
+                simplified["type"] = non_null[0]
+        return simplified
+    if isinstance(node, list):
+        return [_simplify_schema_types(value) for value in node]
+    return node
+
+
+def _split_env_list(name: str) -> list[str]:
+    """Parse a comma-separated environment variable into stripped entries.
+
+    Empty entries are dropped so a trailing comma does not shift a positional
+    pairing (see voice_labels).
+    """
+
+    return [item.strip() for item in os.getenv(name, "").split(",") if item.strip()]
+
+
 def voice_options() -> list[str]:
     """A small documented selection; extra approved voice IDs may be configured."""
     voices = [DEFAULT_VOICE, "Ethan", os.getenv("QWEN_REALTIME_VOICE", DEFAULT_VOICE)]
-    voices.extend(os.getenv("QWEN_REALTIME_EXTRA_VOICES", "").split(","))
+    voices.extend(_split_env_list("QWEN_REALTIME_EXTRA_VOICES"))
     return list(dict.fromkeys(voice.strip() for voice in voices if voice.strip()))
+
+
+def voice_labels() -> dict[str, str]:
+    """Optional display names for the configured voices.
+
+    ``QWEN_REALTIME_VOICE_LABELS`` is positional against
+    ``QWEN_REALTIME_EXTRA_VOICES``: the Nth label names the Nth extra voice.
+    Positional pairing keeps the provider's voice IDs authoritative, so a
+    renamed or removed voice can never be sent to Qwen by mistake - it simply
+    falls back to showing its ID. Labels are display-only and are never sent
+    as the ``voice`` parameter.
+    """
+
+    extra = _split_env_list("QWEN_REALTIME_EXTRA_VOICES")
+    labels = _split_env_list("QWEN_REALTIME_VOICE_LABELS")
+    mapping: dict[str, str] = {}
+    for index, voice in enumerate(extra):
+        if index < len(labels):
+            mapping[voice] = labels[index]
+    return mapping
 
 
 def selected_model() -> str:
@@ -72,11 +130,17 @@ def build_session_config(
     tools = []
     for tool in build_voice_realtime_tools(memory_mode=memory_mode):
         # Qwen expects Chat Completions-style nested function definitions.
+        # Parameter schemas also have to avoid nullable unions - see
+        # _simplify_schema_types.
         tools.append(
             {
                 "type": "function",
                 "function": {
-                    key: tool[key]
+                    key: (
+                        _simplify_schema_types(tool[key])
+                        if key == "parameters"
+                        else tool[key]
+                    )
                     for key in ("name", "description", "parameters")
                     if key in tool
                 },
@@ -87,6 +151,18 @@ def build_session_config(
         "modalities": ["text", "audio"],
         "enable_input_audio_transcription": True,
         "voice": voice,
+        # WebRTC delivers Opus, but Qwen still needs the *decoded* input format
+        # declared, and it only accepts 16 kHz PCM here. Without this the server
+        # accepts the session and counts every inbound RTP packet (verified via
+        # remote-inbound-rtp: packetsReceived == packetsSent, no loss) yet never
+        # runs VAD, so the session reports connected and then stays silent:
+        # no speech_started, no transcript, no reply. Declaring 16 kHz PCM makes
+        # the same audio produce speech_started -> committed -> transcription ->
+        # response. 24000 is the documented default output rate.
+        "audio": {
+            "input": {"format": {"type": "pcm", "sample_rate": 16000}},
+            "output": {"format": {"type": "pcm", "sample_rate": 24000}},
+        },
         "turn_detection": {"type": vad, "threshold": 0.5, "silence_duration_ms": 800},
         "instructions": build_voice_instructions(
             thread_id=thread_id,

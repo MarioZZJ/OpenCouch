@@ -115,21 +115,7 @@ class VoiceRealtimeSessionRequest(BaseModel):
     thread_id: str = Field(min_length=1)
     user_id: str | None = None
     memory_mode: ApiMemoryMode | None = None
-    assistant_voice: (
-        Literal[
-            "alloy",
-            "ash",
-            "ballad",
-            "cedar",
-            "coral",
-            "echo",
-            "marin",
-            "sage",
-            "shimmer",
-            "verse",
-        ]
-        | None
-    ) = None
+    assistant_voice: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class VoiceToolCallRequest(BaseModel):
@@ -331,10 +317,18 @@ class EndSessionResponse(SessionEndResponse):
     """POST /api/threads/{thread_id}/end response body."""
 
 
+class VoiceQwenSdpRequest(BaseModel):
+    """One-time signaling exchange; no provider URLs or API keys from the browser."""
+
+    ticket: str = Field(min_length=32, max_length=128)
+    sdp: str = Field(min_length=10, max_length=65536)
+
+
 class VoiceRealtimeSessionResponse(BaseModel):
     """POST /api/voice/realtime/session response body."""
 
     client_secret: str
+    provider: Literal["openai", "qwen"] = "openai"
     thread_id: str
     user_id: str | None = None
     memory_mode: Literal["incognito", "persistent"]

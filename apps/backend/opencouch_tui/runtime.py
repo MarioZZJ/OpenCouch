@@ -31,6 +31,7 @@ from config import (
     create_configured_response_llm_client,
     get_settings,
 )
+from llm.providers import ProviderConfigurationError
 from llm.base import BaseLLMClient
 
 MemoryModeName = Literal["guest", "persistent"]
@@ -336,6 +337,8 @@ def resolve_llm_client(
         return create_configured_control_llm_client(settings=settings), "hybrid"
     try:
         return create_configured_control_llm_client(settings=settings), "hybrid"
+    except ProviderConfigurationError:
+        raise
     except Exception:
         return None, "deterministic"
 
@@ -352,6 +355,8 @@ def resolve_response_llm_client(
         return None
     try:
         return create_configured_response_llm_client(tier, settings=settings)
+    except ProviderConfigurationError:
+        raise
     except Exception:
         return None
 

@@ -60,6 +60,7 @@ from config import (
     create_configured_response_llm_clients,
     get_settings,
 )
+from llm.providers import ProviderConfigurationError
 from llm.base import BaseLLMClient
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
     # Missing API keys leave clients as None, keeping deterministic paths available.
     try:
         _llm_client = create_configured_control_llm_client()
+    except ProviderConfigurationError:
+        raise
     except Exception:
         _llm_client = None
     try:
@@ -128,6 +131,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:  # noqa: ARG001
             "fast": response_clients["fast"],
             "quality": response_clients["quality"],
         }
+    except ProviderConfigurationError:
+        raise
     except Exception:
         _response_llm_clients = {"fast": None, "quality": None}
 

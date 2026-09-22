@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
+
+from llm.providers import LLMProvider, default_model
 
 from dotenv import load_dotenv
 
@@ -13,7 +15,6 @@ from llm.base import BaseLLMClient
 from llm.factory import create_llm_client
 from llm.openai_client import DEFAULT_OPENAI_MODEL
 
-LLMProvider = Literal["openai"]
 ResponseModelTier = Literal["fast", "quality"]
 PersistenceBackend = Literal["postgres"]
 TextSessionBackend = Literal["auto", "disabled", "sqlite", "sqlalchemy"]
@@ -120,19 +121,42 @@ def get_settings() -> Settings:
         "auto",
     )
 
+    control_model = os.getenv("LLM_MODEL") or (
+        os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+        if provider == "openai"
+        else default_model(provider)
+    )
+    fast_model = (
+        os.getenv("RESPONSE_FAST_LLM_MODEL")
+        or (
+            os.getenv("RESPONSE_FAST_OPENAI_MODEL")
+            if response_fast_provider == "openai"
+            else None
+        )
+        or (
+            control_model
+            if response_fast_provider == provider
+            else default_model(response_fast_provider)
+        )
+    )
+    quality_model = (
+        os.getenv("RESPONSE_QUALITY_LLM_MODEL")
+        or (
+            os.getenv("RESPONSE_QUALITY_OPENAI_MODEL")
+            if response_quality_provider == "openai"
+            else None
+        )
+        or default_model(response_quality_provider, quality=True)
+        or (control_model if response_quality_provider == provider else "")
+    )
+
     return Settings(
         llm_provider=provider,
-        openai_model=os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
+        openai_model=control_model,
         response_fast_provider=response_fast_provider,
-        response_fast_openai_model=os.getenv(
-            "RESPONSE_FAST_OPENAI_MODEL",
-            os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
-        ),
+        response_fast_openai_model=fast_model,
         response_quality_provider=response_quality_provider,
-        response_quality_openai_model=os.getenv(
-            "RESPONSE_QUALITY_OPENAI_MODEL",
-            DEFAULT_OPENAI_QUALITY_MODEL,
-        ),
+        response_quality_openai_model=quality_model,
         persistence_backend=persistence_backend,
         memory_database_url=os.getenv("OPENCOUCH_MEMORY_DATABASE_URL"),
         allow_legacy_sqlite=allow_legacy_sqlite,
@@ -202,8 +226,8 @@ def _read_provider_env(name: str, fallback: LLMProvider) -> LLMProvider:
     """
 
     raw = os.getenv(name, fallback).strip().lower()
-    if raw == "openai":
-        return "openai"
+    if raw in {"openai", "qwen", "deepseek", "openai_compatible"}:
+        return cast(LLMProvider, raw)
     raise ValueError(f"Unsupported {name} value: {raw}")
 
 

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
+
+from llm.providers import ProviderConfigurationError
+from agent.voice import qwen_realtime
 
 from openai import AsyncOpenAI
 
@@ -37,6 +41,15 @@ def build_realtime_session_config(
     normalized_mode = memory_mode.strip().lower()
     if normalized_mode not in {"incognito", "persistent"}:
         raise ValueError("memory_mode must be 'incognito' or 'persistent'.")
+
+    if get_voice_provider() == "qwen":
+        return qwen_realtime.build_session_config(
+            thread_id=normalized_thread_id,
+            user_id=user_id.strip() if user_id else None,
+            memory_mode=normalized_mode,
+            memory_context=memory_context,
+            assistant_voice=assistant_voice,
+        )
 
     realtime_voice = _normalize_realtime_voice(assistant_voice)
     trace_event(
@@ -93,6 +106,9 @@ async def create_realtime_client_secret(
 ) -> str:
     """Create an ephemeral OpenAI Realtime client secret."""
 
+    if get_voice_provider() == "qwen":
+        return qwen_realtime.create_signaling_ticket(session_config)
+
     extra_headers = (
         {"OpenAI-Safety-Identifier": safety_identifier} if safety_identifier else None
     )
@@ -101,3 +117,38 @@ async def create_realtime_client_secret(
         extra_headers=extra_headers,
     )
     return str(response.value)
+
+
+def get_voice_provider() -> str:
+    """Text and speech providers are independent deployment choices."""
+    provider = os.getenv("OPENCOUCH_VOICE_PROVIDER", "openai").strip().lower()
+    if provider not in {"openai", "qwen"}:
+        raise ProviderConfigurationError(
+            "OPENCOUCH_VOICE_PROVIDER must be openai or qwen."
+        )
+    return provider
+
+
+def get_voice_capabilities() -> dict[str, Any]:
+    provider = get_voice_provider()
+    if provider == "qwen":
+        return {
+            "provider": provider,
+            "model": qwen_realtime.selected_model(),
+            "default_voice": os.getenv(
+                "QWEN_REALTIME_VOICE", qwen_realtime.DEFAULT_VOICE
+            ),
+            "voices": qwen_realtime.voice_options(),
+            # Display names only; the `voices` IDs remain authoritative and are
+            # what gets sent to Qwen.
+            "voice_labels": qwen_realtime.voice_labels(),
+            "experimental": True,
+        }
+    return {
+        "provider": provider,
+        "model": DEFAULT_REALTIME_MODEL,
+        "default_voice": DEFAULT_REALTIME_VOICE,
+        "voices": sorted(SUPPORTED_REALTIME_VOICES),
+        "voice_labels": {},
+        "experimental": False,
+    }

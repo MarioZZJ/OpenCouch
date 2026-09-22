@@ -22,8 +22,8 @@ export const ASSISTANT_VOICE_OPTIONS = [
   { value: "shimmer", label: "shimmer" },
 ] as const;
 
-export type AssistantVoiceOption =
-  (typeof ASSISTANT_VOICE_OPTIONS)[number]["value"];
+// Validated against the selected provider by the server.
+export type AssistantVoiceOption = string;
 
 export type ApiMemoryMode = "persistent" | "incognito";
 export type VoiceMemoryMode = ApiMemoryMode;
@@ -130,6 +130,7 @@ export interface SessionEndResponse {
 export type EndSessionResponse = SessionEndResponse;
 
 export interface RealtimeVoiceSessionResponse {
+  provider?: "openai" | "qwen";
   client_secret: string;
   thread_id: string;
   user_id: string | null;
@@ -982,4 +983,33 @@ export async function endRealtimeVoiceSession(
     },
     "Realtime voice end"
   );
+}
+
+
+export interface RealtimeVoiceConfiguration {
+  provider: "openai" | "qwen";
+  model: string;
+  default_voice: string;
+  voices: string[];
+  /** Optional display names keyed by voice ID. Display-only; never sent upstream. */
+  voice_labels?: Record<string, string>;
+  experimental: boolean;
+}
+
+export async function getRealtimeVoiceConfiguration(): Promise<RealtimeVoiceConfiguration> {
+  return apiRequest<RealtimeVoiceConfiguration>(
+    `${API_BASE}/voice/realtime/config`, {}, "Voice configuration"
+  );
+}
+
+export async function exchangeQwenRealtimeSdp(ticket: string, sdp: string): Promise<string> {
+  const result = await apiRequest<{ sdp: string }>(
+    `${API_BASE}/voice/realtime/qwen/sdp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ticket, sdp }),
+      signal: AbortSignal.timeout(25000),
+    }, "Qwen voice signaling"
+  );
+  return result.sdp;
 }

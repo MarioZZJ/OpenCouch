@@ -80,6 +80,13 @@ Confidence policy:
   clarification policy or when you would otherwise be guessing. In those cases,
   prefer the most conservative interpretation in reasoning rather than
   overcommitting.
+
+Field length policy:
+- reasoning must be at most 240 characters. This is a private routing note for
+  downstream evaluation, not user-visible text, so compress it into one or two
+  short clauses instead of narratives. When a turn is long or mixed, summarize
+  the decisive fact and the chosen policy rather than restating the user's story.
+- Keep intent_summary compact for the same reason.
 """
 
 _TRIAGE_DEFINITION = AgentDefinition(

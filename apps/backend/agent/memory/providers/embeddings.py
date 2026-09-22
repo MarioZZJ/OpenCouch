@@ -223,6 +223,7 @@ class OpenAIEmbeddingProvider:
         api_key: str | None = None,
         model: str = DEFAULT_OPENAI_EMBEDDING_MODEL,
         dimension: int = DEFAULT_OPENAI_EMBEDDING_DIMENSION,
+        base_url: str | None = None,
     ) -> None:
         """Initialize an OpenAI-backed embedding provider.
 
@@ -247,7 +248,9 @@ class OpenAIEmbeddingProvider:
 
         from openai import AsyncOpenAI
 
-        self._client = AsyncOpenAI(api_key=resolved_key)
+        self._client = AsyncOpenAI(
+            api_key=resolved_key, **({"base_url": base_url} if base_url else {})
+        )
         self._model = model
         self._dimension = dimension
 
@@ -305,7 +308,7 @@ class OpenAIEmbeddingProvider:
                 model=self._model,
                 input=sanitized,
             )
-            if self._model.startswith("text-embedding-3"):
+            if self._model.startswith("text-embedding-3") or self._model == "text-embedding-v4":
                 request["dimensions"] = self._dimension
             response = await self._client.embeddings.create(**request)
         except Exception:
@@ -353,6 +356,24 @@ def create_configured_embedding_provider() -> EmbeddingProvider:
     Returns:
         EmbeddingProvider: OpenAI or null provider based on env config.
     """
+
+    from llm.providers import ProviderConfigurationError, provider_connection
+
+    provider = os.getenv("EMBEDDING_PROVIDER", "openai").strip().lower()
+    if provider == "none":
+        return NullEmbeddingProvider()
+    if provider in {"qwen", "openai_compatible"}:
+        key, url = provider_connection(provider)
+        model = os.getenv("EMBEDDING_MODEL", "text-embedding-v4" if provider == "qwen" else "")
+        try:
+            dimension = int(os.getenv("EMBEDDING_DIMENSION", "1024"))
+        except ValueError as exc:
+            raise ProviderConfigurationError("EMBEDDING_DIMENSION must be an integer.") from exc
+        if not model or dimension < 1:
+            raise ProviderConfigurationError("Set EMBEDDING_MODEL and a positive EMBEDDING_DIMENSION.")
+        return OpenAIEmbeddingProvider(api_key=key, base_url=url, model=model, dimension=dimension)
+    if provider != "openai":
+        raise ProviderConfigurationError("EMBEDDING_PROVIDER must be openai, qwen, openai_compatible, or none.")
 
     if os.getenv("OPENAI_API_KEY"):
         try:
